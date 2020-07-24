@@ -5,96 +5,163 @@
             [byte-streams :as bs]
             [hasch.core :refer [uuid]]
             [konserve
-             [protocols :refer [-bassoc -bget -deserialize -exists?
-                                -get-in -serialize -update-in
-                                PBinaryAsyncKeyValueStore PEDNAsyncKeyValueStore]]
-             [serializers :as ser]]
+             [protocols :refer [PEDNAsyncKeyValueStore
+                                -get -get-meta -update-in -dissoc -assoc-in
+                                PBinaryAsyncKeyValueStore -bget -bassoc
+                                -serialize -deserialize
+                                PKeyIterable
+                                -keys
+                                -serialize -deserialize]]
+             [serializers :refer [key->serializer byte->key serializer-class->byte]]
+             [compressor :refer [byte->compressor compressor->byte lz4-compressor]]]
             [konserve.core :as k])
-  (:import [java.io ByteArrayInputStream ByteArrayOutputStream]))
+  (:import [java.io ByteArrayInputStream ByteArrayOutputStream]
+           [java.nio ByteBuffer]))
 
-(defrecord RocksDBStore [rdb serializer read-handlers write-handlers locks]
+(defn to-byte-array
+  "Return 4 Byte Array with following content
+     1th Byte = Version of Konserve
+     2th Byte = Serializer Type
+     3th Byte = Compressor Type
+     4th Byte = Encryptor Type"
+  [version serializer compressor encryptor]
+  (let [env-array        (byte-array [version serializer compressor encryptor])
+        return-buffer    (ByteBuffer/allocate 4)
+        _                (.put return-buffer env-array)
+        return-array     (.array return-buffer)]
+    (.clear return-buffer)
+    return-array))
+
+(def version 1) ;storage-layout => namespace
+
+(def encrypt 0)
+
+(defn write-edn [edn serializer compressor write-handlers]
+  (let [bos           (ByteArrayOutputStream.)
+        serializer-id (get serializer-class->byte (type serializer))
+        compressor-id (get compressor->byte compressor)
+        _             (.write bos (to-byte-array version serializer-id compressor-id encrypt))
+        _             (-serialize (compressor serializer) bos write-handlers edn)]
+    (.toByteArray bos)))
+
+(defn read-edn [ba serializers read-handlers]
+  (let [serializer-id  (aget ba 1)
+        compressor-id  (aget ba 2)
+        serializer-key (byte->key serializer-id)
+        serializer     (get serializers serializer-key)
+        compressor     (byte->compressor compressor-id)
+        bis            (ByteArrayInputStream. ba 4 (count ba))
+        edn            (-deserialize (compressor serializer) read-handlers bis)]
+    [edn serializer]))
+
+(defn exists? [rdb id]
+  (let [it  (rocks/iterator rdb (bs/to-byte-array id))]
+    (try
+      (=
+       (when-let [k (ffirst it)]
+         (String. k))
+       id)
+      (catch java.util.NoSuchElementException e
+        false)
+      (catch Exception e
+        (ex-info "Could not search for key."
+                 {:type      :exist-error
+                  :key       key
+                  :exception e}))
+      (finally
+        (.close it)))))
+
+(defrecord RocksDBStore [rdb serializers default-serializer compressor read-handlers write-handlers locks]
   PEDNAsyncKeyValueStore
   (-exists? [this key]
     ;; trick with iterator to not read values
     (let [res (chan)]
-      (try
-        (let [id (str (uuid key))
-              it (rocks/iterator rdb (bs/to-byte-array id))
-              its (when-let [k (ffirst it)]
-                    (String. k))]
-          (.close it)
-          (put! res (= its id)))
-        (catch java.util.NoSuchElementException e
-          (put! res false))
-        (catch Exception e
-          (put! res (ex-info "Could not search for key."
-                             {:type :exist-error
-                              :key key
-                              :exception e})))
-        (finally
-          (close! res)))
+      (put! res (exists? rdb (str (uuid key) ".ksv")))
       res))
 
-
-  (-get-in [this key-vec]
-    (let [[fkey & rkey] key-vec
-          id (str (uuid fkey))
+  (-get [this key] 
+    (let [id  (str "v" (uuid key) ".ksv")
           val (rocks/get rdb id)]
       (if (= val nil)
         (go nil)
         (let [res-ch (chan)]
           (try
-            (let [bais (ByteArrayInputStream. val)]
-              (if-let [res (get-in
-                              (second (-deserialize serializer read-handlers bais))
-                              rkey)]
-                (put! res-ch res)))
+            (let [bais (ByteArrayInputStream. val)
+                  res  (first (read-edn bais serializers read-handlers))]
+                (when res
+                  (put! res-ch res)))
             (catch Exception e
               (put! res-ch (ex-info "Could not read key."
-                                   {:type :read-error
-                                    :key fkey
-                                    :exception e})))
+                                    {:type      :read-error
+                                     :key       key
+                                     :exception e})))
             (finally
               (close! res-ch)))
           res-ch))))
 
-  (-update-in [this key-vec up-fn]
-    (let [[fkey & rkey] key-vec
-          id (str (uuid fkey))]
-      (let [res-ch (chan)]
-        (try
-          (let [old-bin (rocks/get rdb id)
-                old (when old-bin
-                      (let [bais (ByteArrayInputStream. old-bin)]
-                        (second (-deserialize serializer write-handlers bais))))
-                new (if (empty? rkey)
-                      (up-fn old)
-                      (update-in old rkey up-fn))]
-            (let [baos (ByteArrayOutputStream.)]
-              (-serialize serializer baos write-handlers [key-vec new])
-              (rocks/put rdb id (.toByteArray baos)))
-            (put! res-ch [(get-in old rkey)
-                          (get-in new rkey)]))
-          (catch Exception e
-            (put! res-ch (ex-info "Could not write key."
-                                  {:type :write-error
-                                   :key fkey
-                                   :exception e})))
-          (finally
-            (close! res-ch)))
-        res-ch)))
+  (-get-meta [this key] 
+    (let [id  (str (uuid key) ".ksv")
+          val (rocks/get rdb id)]
+      (if (= val nil)
+        (go nil)
+        (let [res-ch (chan)]
+          (try
+            (let [bais (ByteArrayInputStream. val)
+                  res  (first (read-edn bais serializers read-handlers))]
+              (when res
+                (put! res-ch res)))
+            (catch Exception e
+              (put! res-ch (ex-info "Could not read key."
+                                    {:type      :read-meta-error
+                                     :key       key
+                                     :exception e})))
+            (finally
+              (close! res-ch)))
+          res-ch))))
 
-  (-assoc-in [this key-vec val] (-update-in this key-vec (fn [_] val)))
+  (-assoc-in [this key-vec meta-up val]  (-update-in this key-vec meta-up (fn [_] val) []))
+
+  (-update-in [this key-vec up-fn-meta up-fn up-fn-args]
+    (let [[fkey & rkey] key-vec
+          id            (str (uuid fkey) ".ksv") ;it must support emoji's
+          v-id          (str "v" id)
+          res-ch        (chan)]
+      (try
+        (let [[[old-meta _] [old-val serializer]] (if (exists? rdb id)
+                                                    [(read-edn (rocks/get rdb id) serializers read-handlers) (read-edn (rocks/get rdb v-id) serializers read-handlers)]
+                                                    [[nil] [nil (get serializers default-serializer)]])
+              new-meta                            (up-fn-meta old-meta)
+              new-val                             (if-not (empty? rkey)
+                                                    (apply update-in old-val rkey up-fn up-fn-args)
+                                                    (apply up-fn old-val up-fn-args)) 
+              bam                                 (write-edn new-meta serializer compressor write-handlers)
+              bav                                 (write-edn new-val serializer compressor write-handlers)]
+          (rocks/put rdb
+                     id    bam
+                     v-id  bav)
+          (put! res-ch [(get-in old-val rkey)
+                        (get-in new-val rkey)]))
+        (catch Exception e
+          (put! res-ch (ex-info "Could not write key."
+                                {:type      :write-error
+                                 :key       fkey
+                                 :exception e})))
+        (finally
+          (close! res-ch)))
+        res-ch))
 
   (-dissoc [this key]
-    (let [id (str (uuid key))
+    (let [id     (str (uuid key) ".ksv")
           res-ch (chan)]
       (try
-        (rocks/delete rdb id)
+        (rocks/delete
+         rdb
+         (str id)
+         (str "v" id))
         (catch Exception e
           (put! res-ch (ex-info "Could not delete key."
-                                {:type :delete-error
-                                 :key key
+                                {:type      :delete-error
+                                 :key       key
                                  :exception e})))
         (finally
           (close! res-ch)))
@@ -102,7 +169,7 @@
 
   PBinaryAsyncKeyValueStore
   (-bget [this key locked-cb]
-    (let [id (str (uuid key))
+    (let [id  (str (uuid key) ".ksv")
           val (rocks/get rdb id)]
       (if (nil? val)
         (go nil)
@@ -110,40 +177,54 @@
           (try
             (let [bais (ByteArrayInputStream. val)]
               (locked-cb {:input-stream bais
-                          :size (count val)}))
+                          :size         (count val)
+                                        ;TODO Return binary must be in map ; the size, compliance test; test binary map
+                                        ;TODO globally encryptor layout-store => namespace => pullout from all other backends => storage-layout
+                          ;TODO low-level protocol header compressor 
+                          }))
             (catch Exception e
               (ex-info "Could not read key."
-                       {:type :read-error
-                        :key key
+                       {:type      :read-error
+                        :key       key
                         :exception e})))))))
 
-  (-bassoc [this key input]
-    (let [id (str (uuid key))]
+  (-bassoc [this key up-fn-meta input]
+    (let [id   (str (uuid key) ".ksv")
+          v-id (str "v" (uuid key) ".ksv")]
       (go
         (try
-          (rocks/put rdb id input)
+          (let [[old-meta serializer] (if (exists? rdb id)
+                                        (read-edn (rocks/get rdb id) serializers read-handlers)
+                                        [nil (get serializers default-serializer)])
+                new-meta              (up-fn-meta old-meta)
+                bam                   (write-edn new-meta serializer compressor write-handlers)]
+            (rocks/put rdb id bam)
+            (rocks/put rdb v-id input))
           nil
           (catch Exception e
             (ex-info "Could not write key."
-                     {:type :write-error
-                      :key key
+                     {:type      :write-error
+                      :key       key
                       :exception e})))))))
 
 
 
 (defn new-rocksdb-store
-  [path & {:keys [rocksdb-opts serializer read-handlers write-handlers]
-           :or {serializer (ser/fressian-serializer)
-                read-handlers (atom {})
-                write-handlers (atom {})
-                rocksdb-opts {}}}]
+  [path & {:keys [rocksdb-opts default-serializer serializers compressor read-handlers write-handlers]
+           :or   {default-serializer :FressianSerializer
+                  compressor         lz4-compressor
+                  read-handlers      (atom {})
+                  write-handlers     (atom {})}}]
   (go (try
         (let [db (create-db path rocksdb-opts)]
           (map->RocksDBStore {:rdb db
-                              :read-handlers read-handlers
-                              :write-handlers write-handlers
-                              :serializer serializer
-                              :locks (atom {})}))
+                                        ;  :detect-old-version detect-old-version
+                              :default-serializer default-serializer
+                              :serializers        (merge key->serializer serializers)
+                              :compressor         compressor
+                              :read-handlers      read-handlers
+                              :write-handlers     write-handlers
+                              :locks              (atom {})}))
         (catch Exception e
           e))))
 
@@ -163,8 +244,6 @@
 
   (def store (<!! (new-rocksdb-store "/tmp/rocksdb3")))
 
-  (require '[konserve.core :as k])
-
   (get (:rdb store) (str (uuid "foo")))
 
   (:locks store)
@@ -175,6 +254,10 @@
 
   (<!! (k/assoc-in store ["foo"] {:foo 42}))
 
+  (<!! (k/get-meta store ["foo"]))
+
+  (<!! (k/get store ["foo"]))
+
   (<!! (k/update-in store ["foo" :foo] inc))
 
   (<!! (k/bget store ["foo"] (fn [arg]
@@ -182,15 +265,4 @@
                                  (io/copy (:input-stream arg) baos)
                                  (prn "cb" (vec (.toByteArray baos)))))))
 
-  (<!! (k/bassoc store ["foo"] (byte-array [42 42 42 42 42])))
-
-
-  (def db (create-db "/tmp/rocksdb" {}))
-
-  (get db "foo")
-
-  (put db "foo" 42)
-
-
-
-  )
+  (<!! (k/bassoc store ["foo"] (byte-array [42 42 42 42 42]))))
