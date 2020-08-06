@@ -32,7 +32,7 @@
     (.clear return-buffer)
     return-array))
 
-(def version 1) ;storage-layout => namespace
+(def version 1)
 
 (def encrypt 0)
 
@@ -71,6 +71,7 @@
       (finally
         (.close it)))))
 
+
 (defrecord RocksDBStore [rdb serializers default-serializer compressor read-handlers write-handlers locks]
   PEDNAsyncKeyValueStore
   (-exists? [this key]
@@ -80,14 +81,13 @@
       res))
 
   (-get [this key] 
-    (let [id  (str "v" (uuid key) ".ksv")
+    (let [id  (str "v_" (uuid key) ".ksv")
           val (rocks/get rdb id)]
       (if (= val nil)
         (go nil)
         (let [res-ch (chan)]
           (try
-            (let [bais (ByteArrayInputStream. val)
-                  res  (first (read-edn bais serializers read-handlers))]
+            (let [res  (first (read-edn val serializers read-handlers))]
                 (when res
                   (put! res-ch res)))
             (catch Exception e
@@ -106,8 +106,7 @@
         (go nil)
         (let [res-ch (chan)]
           (try
-            (let [bais (ByteArrayInputStream. val)
-                  res  (first (read-edn bais serializers read-handlers))]
+            (let [res  (first (read-edn val  serializers read-handlers))]
               (when res
                 (put! res-ch res)))
             (catch Exception e
@@ -123,8 +122,8 @@
 
   (-update-in [this key-vec up-fn-meta up-fn up-fn-args]
     (let [[fkey & rkey] key-vec
-          id            (str (uuid fkey) ".ksv") ;it must support emoji's
-          v-id          (str "v" id)
+          id            (str (uuid fkey) ".ksv")
+          v-id          (str "v_" id)
           res-ch        (chan)]
       (try
         (let [[[old-meta _] [old-val serializer]] (if (exists? rdb id)
@@ -157,7 +156,7 @@
         (rocks/delete
          rdb
          (str id)
-         (str "v" id))
+         (str "v_" id))
         (catch Exception e
           (put! res-ch (ex-info "Could not delete key."
                                 {:type      :delete-error
@@ -175,13 +174,8 @@
         (go nil)
         (go
           (try
-            (let [bais (ByteArrayInputStream. val)]
-              (locked-cb {:input-stream bais
-                          :size         (count val)
-                                        ;TODO Return binary must be in map ; the size, compliance test; test binary map
-                                        ;TODO globally encryptor layout-store => namespace => pullout from all other backends => storage-layout
-                          ;TODO low-level protocol header compressor 
-                          }))
+              (locked-cb {:input-stream  (ByteArrayInputStream. val)
+                          :size         (count val)})
             (catch Exception e
               (ex-info "Could not read key."
                        {:type      :read-error
@@ -190,7 +184,7 @@
 
   (-bassoc [this key up-fn-meta input]
     (let [id   (str (uuid key) ".ksv")
-          v-id (str "v" (uuid key) ".ksv")]
+          v-id (str "v_" (uuid key) ".ksv")]
       (go
         (try
           (let [[old-meta serializer] (if (exists? rdb id)
@@ -205,9 +199,26 @@
             (ex-info "Could not write key."
                      {:type      :write-error
                       :key       key
-                      :exception e})))))))
-
-
+                      :exception e}))))))
+  PKeyIterable
+  (-keys [this]
+    (let [iterator (rocks/iterator rdb)]
+      (go
+        (if (empty? iterator)
+          #{}
+          (try
+            (reduce
+             (fn [list-keys [n v]]
+               (if (string? (re-find #"v_" (String. n)))
+                 list-keys
+                 (into list-keys [(first (read-edn v serializers read-handlers))])))
+             #{}
+             iterator)
+            (catch Exception e
+              {:msg :read-keys-error
+               :e   e})
+            (finally
+              (.close iterator))))))))
 
 (defn new-rocksdb-store
   [path & {:keys [rocksdb-opts default-serializer serializers compressor read-handlers write-handlers]
@@ -242,7 +253,7 @@
 
 (comment
 
-  (def store (<!! (new-rocksdb-store "/tmp/rocksdb3")))
+  (def store (<!! (new-rocksdb-store "/tmp/rocksdb2")))
 
   (get (:rdb store) (str (uuid "foo")))
 
@@ -252,11 +263,16 @@
 
   (<!! (k/exists? store "foo"))
 
-  (<!! (k/assoc-in store ["foo"] {:foo 42}))
+  (first (<!! (k/assoc-in store 0 {:foo 42})))
 
-  (<!! (k/get-meta store ["foo"]))
 
-  (<!! (k/get store ["foo"]))
+  (<!! (k/keys store))
+
+  (<!! (k/assoc store :foo2 {:baz 21}))
+
+  (<!! (k/get-meta store "foo"))
+
+  (<!! (k/get store "foo"))
 
   (<!! (k/update-in store ["foo" :foo] inc))
 
