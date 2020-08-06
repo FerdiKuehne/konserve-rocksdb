@@ -5,5 +5,5 @@
             :url "http://www.eclipse.org/legal/epl-v10.html"}
   :dependencies [[org.clojure/clojure "1.10.1"]
                  [io.replikativ/konserve "0.6.1-SNAPSHOT"]
-                 [kotyo/clj-rocksdb "0.1.3"]])
+                 [kotyo/clj-rocksdb "0.1.6"]])
 
